@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>工程ステーション管理 | Whiteout Survival</title>
+  <script>
+    // Babelの「in-browser transformer」警告を非表示にする
+    const _origWarn = console.warn;
+    console.warn = function(...args) {
+      if (typeof args[0] === "string" && args[0].includes("in-browser Babel transformer")) return;
+      _origWarn.apply(console, args);
+    };
+  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d0d1a; font-family: 'Segoe UI', 'Hiragino Sans', 'Yu Gothic', sans-serif; }
+    input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(1); }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #1a202c; }
+    ::-webkit-scrollbar-thumb { background: #4a5568; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    const STATION_COUNT = 12;
+    const PROTECTED_DURATION = 3 * 24 * 60 * 60 * 1000; // 保護状態: 3日
+    const SVS_DURATION = 12 * 60 * 60 * 1000; // SVS: 土曜19:00〜日曜07:00 = 12時間
+
+    function getNextSVS(referenceDate = new Date()) {
+      const year = referenceDate.getFullYear();
+      const month = referenceDate.getMonth();
+      const saturdays = [];
+      for (let m = 0; m <= 1; m++) {
+        const d = new Date(year, month + m, 1);
+        while (d.getDay() !== 6) d.setDate(d.getDate() + 1);
+        for (let w = 0; w < 5; w++) {
+          const sat = new Date(year, month + m, d.getDate() + w * 7, 19, 0, 0, 0);
+          if (sat > referenceDate) saturdays.push(sat);
+        }
+      }
+      return saturdays[0];
+    }
+
+    function formatDuration(ms) {
+      if (ms <= 0) return "00:00:00";
+      const totalSec = Math.floor(ms / 1000);
+      const d = Math.floor(totalSec / 86400);
+      const h = Math.floor((totalSec % 86400) / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      const hms = `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+      return d > 0 ? `${d}日 ${hms}` : hms;
+    }
+
+    function formatDateTime(date) {
+      if (!date) return "未設定";
+      return `${date.getMonth()+1}/${date.getDate()} ${String(date.getHours()).padStart(2,"0")}:${String(date.getMinutes()).padStart(2,"0")}`;
+    }
+
+    function toLocalInputValue(date) {
+      const pad = n => String(n).padStart(2,"0");
+      return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    // 保護開始時刻を起点にステーションの状態を判定
+    function getStationStatus(station, now) {
+      if (!station.protectStart) {
+        return { type: "idle", label: "未設定", color: "#4a5568", bg: "#1a202c" };
+      }
+      const protectStart = new Date(station.protectStart);
+      const protectEnd = new Date(protectStart.getTime() + PROTECTED_DURATION);
+
+      if (now < protectStart) {
+        // まだ確保前（予定として入力されている）
+        return {
+          type: "scheduled", label: "確保予定", color: "#63b3ed", bg: "#2c5282",
+          remaining: protectStart - now, protectStart, protectEnd
+        };
+      } else if (now < protectEnd) {
+        // 保護中
+        return {
+          type: "protect", label: "保護中", color: "#48bb78", bg: "#1c4532",
+          remaining: protectEnd - now, protectStart, protectEnd
+        };
+      } else {
+        // 保護切れ → 争奪可能中
+        return {
+          type: "contest", label: "争奪可能中", color: "#ed8936", bg: "#7b341e",
+          elapsed: now - protectEnd, protectStart, protectEnd
+        };
+      }
+    }
+
+    // SVS期間（開始〜終了）を保護がカバーしているか判定
+    function willBeProtectedAtSVS(station, svsStart, svsEnd) {
+      if (!station.protectStart) return false;
+      const protectStart = new Date(station.protectStart);
+      const protectEnd = new Date(protectStart.getTime() + PROTECTED_DURATION);
+      return protectStart <= svsStart && protectEnd >= svsEnd;
+    }
+
+    // 「現在の保護が切れるタイミング」を起点に、3日サイクルで
+    // SVSをカバーできる回まで更新スケジュールを列挙する
+    // 各サイクル = { captureTime: 確保すべき時刻, protectEnd: その場合の保護終了, covers: SVSをカバーできるか }
+    function getUpdateCycles(station, now, svsStart, svsEnd) {
+      let cursor;
+      if (station.protectStart) {
+        const protectEnd = new Date(new Date(station.protectStart).getTime() + PROTECTED_DURATION);
+        cursor = protectEnd > now ? protectEnd : new Date(now);
+      } else {
+        cursor = new Date(now);
+      }
+      const cycles = [];
+      for (let i = 0; i < 15; i++) {
+        if (cursor > svsStart) break;
+        const captureTime = new Date(cursor);
+        const protectEnd = new Date(captureTime.getTime() + PROTECTED_DURATION);
+        const covers = captureTime <= svsStart && protectEnd >= svsEnd;
+        cycles.push({ captureTime, protectEnd, covers });
+        if (covers) break;
+        cursor = protectEnd;
+      }
+      return cycles;
+    }
+
+    function StatusBadge({ status }) {
+      const icons = { idle: "⬜", scheduled: "📅", protect: "🛡️", contest: "⚔️" };
+      return (
+        <span style={{
+          display: "inline-flex", alignItems: "center", gap: 4,
+          padding: "2px 10px", borderRadius: 20, fontSize: 12, fontWeight: 700,
+          color: status.color, background: status.bg, border: `1px solid ${status.color}40`
+        }}>
+          {icons[status.type]} {status.label}
+        </span>
+      );
+    }
+
+    function SVSCountdown({ svsStart, svsEnd, now, coveredCount }) {
+      const remaining = svsStart - now;
+      const inProgress = remaining <= 0 && now < svsEnd;
+      return (
+        <div style={{
+          background: "linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)",
+          border: "1px solid #e94560aa", borderRadius: 16, padding: "16px 20px",
+          marginBottom: 16, boxShadow: "0 0 30px #e9456030"
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <span style={{ color: "#e94560", fontWeight: 900, fontSize: 13, letterSpacing: 2 }}>⚔ SVS まで</span>
+            <span style={{ color: "#a0aec0", fontSize: 11 }}>{formatDateTime(svsStart)} 開始</span>
+          </div>
+          <div style={{ color: "#fff", fontSize: 28, fontWeight: 900, fontFamily: "monospace", letterSpacing: 2, textShadow: "0 0 10px #e94560" }}>
+            {remaining > 0 ? formatDuration(remaining) : (inProgress ? <span style={{color:"#e94560"}}>SVS開催中！</span> : <span style={{color:"#718096"}}>SVS終了</span>)}
+          </div>
+          <div style={{ marginTop: 10, padding: "8px 12px", background: "#ffffff10", borderRadius: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ color: "#a0aec0", fontSize: 12 }}>SVS期間中ずっと保護される予定</span>
+            <span style={{ color: coveredCount === STATION_COUNT ? "#68d391" : "#fbd38d", fontWeight: 900, fontSize: 16 }}>
+              {coveredCount} / {STATION_COUNT}
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    function StationCard({ station, index, now, svsStart, svsEnd, onSetProtect, onReset, onRename }) {
+      const status = getStationStatus(station, now);
+      const covered = willBeProtectedAtSVS(station, svsStart, svsEnd);
+      const cycles = !covered && svsStart > now ? getUpdateCycles(station, now, svsStart, svsEnd) : [];
+      const [expanded, setExpanded] = useState(false);
+      const [captureM, setCaptureM] = useState("");
+      const [captureS, setCaptureS] = useState("");
+      const [editingName, setEditingName] = useState(false);
+      const [nameInput, setNameInput] = useState(station.name);
+
+      const handleNameSubmit = () => {
+        const trimmed = nameInput.trim();
+        if (trimmed) onRename(index, trimmed);
+        setEditingName(false);
+      };
+
+      const handleNameKeyDown = (e) => {
+        if (e.key === "Enter") handleNameSubmit();
+        if (e.key === "Escape") { setNameInput(station.name); setEditingName(false); }
+      };
+
+      const handleNow = () => {
+        onSetProtect(index, new Date());
+      };
+
+      // 「確保完了まで残り○分○秒」から、保護開始時刻(=確保完了時刻)を逆算
+      const handleCaptureSubmit = () => {
+        const m = parseFloat(captureM) || 0;
+        const s = parseFloat(captureS) || 0;
+        if (m === 0 && s === 0) return;
+        const ms = (m * 60 + s) * 1000;
+        const protectStart = new Date(now.getTime() + ms);
+        onSetProtect(index, protectStart);
+        setCaptureM(""); setCaptureS("");
+      };
+
+
+      const cardBg = covered
+        ? "linear-gradient(135deg, #1c4532, #22543d)"
+        : status.type === "contest"
+        ? "linear-gradient(135deg, #7b341e, #9c4221)"
+        : "linear-gradient(135deg, #1a202c, #2d3748)";
+
+      return (
+        <div style={{
+          background: cardBg,
+          border: `1px solid ${covered ? "#48bb78" : status.color}40`,
+          borderRadius: 14, padding: "14px 16px", marginBottom: 10,
+          boxShadow: covered ? "0 0 12px #48bb7840" : "none",
+          transition: "all 0.3s"
+        }}>
+          {/* カードヘッダー */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }}>
+              <div style={{
+                width: 32, height: 32, flexShrink: 0, borderRadius: 8,
+                background: `${status.color}20`, border: `1px solid ${status.color}60`,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                color: status.color, fontWeight: 900, fontSize: 13
+              }}>
+                {String(index + 1).padStart(2,"0")}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {editingName ? (
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <input
+                      autoFocus
+                      value={nameInput}
+                      onChange={e => setNameInput(e.target.value)}
+                      onKeyDown={handleNameKeyDown}
+                      maxLength={20}
+                      style={{
+                        flex: 1, background: "#2d3748", border: "1px solid #63b3ed",
+                        borderRadius: 6, color: "#fff", padding: "4px 8px", fontSize: 14,
+                        fontWeight: 700, outline: "none", minWidth: 0
+                      }}
+                    />
+                    <button onClick={handleNameSubmit} style={{
+                      padding: "4px 10px", borderRadius: 6, border: "none",
+                      background: "#63b3ed", color: "#1a202c", fontWeight: 700, fontSize: 12, cursor: "pointer", flexShrink: 0
+                    }}>保存</button>
+                    <button onClick={() => { setNameInput(station.name); setEditingName(false); }} style={{
+                      padding: "4px 8px", borderRadius: 6, border: "1px solid #4a5568",
+                      background: "transparent", color: "#a0aec0", fontSize: 12, cursor: "pointer", flexShrink: 0
+                    }}>✕</button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <div style={{ color: "#fff", fontWeight: 700, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {station.name}
+                    </div>
+                    <button onClick={() => { setNameInput(station.name); setEditingName(true); }} style={{
+                      background: "none", border: "none", color: "#718096", fontSize: 13,
+                      cursor: "pointer", padding: "0 2px", flexShrink: 0, lineHeight: 1
+                    }}>✏️</button>
+                  </div>
+                )}
+                {!editingName && <StatusBadge status={status} />}
+              </div>
+            </div>
+            {!editingName && (
+              <button onClick={() => setExpanded(!expanded)} style={{
+                background: "none", border: "1px solid #4a556880", borderRadius: 8,
+                color: "#a0aec0", padding: "4px 10px", fontSize: 12, cursor: "pointer", flexShrink: 0, marginLeft: 8
+              }}>
+                {expanded ? "▲" : "▼"}
+              </button>
+            )}
+          </div>
+
+          {/* 状態に応じた情報グリッド */}
+          {status.type === "scheduled" && (
+            <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>確保まで</div>
+                <div style={{ color: status.color, fontWeight: 700, fontSize: 13, fontFamily: "monospace" }}>
+                  {formatDuration(status.remaining)}
+                </div>
+              </div>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>保護終了予定</div>
+                <div style={{ color: "#a0aec0", fontWeight: 700, fontSize: 13 }}>
+                  {formatDateTime(status.protectEnd)}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {status.type === "protect" && (
+            <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>保護残り時間</div>
+                <div style={{ color: status.color, fontWeight: 700, fontSize: 13, fontFamily: "monospace" }}>
+                  {formatDuration(status.remaining)}
+                </div>
+              </div>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>保護終了</div>
+                <div style={{ color: "#a0aec0", fontWeight: 700, fontSize: 13 }}>
+                  {formatDateTime(status.protectEnd)}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {status.type === "contest" && (
+            <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>争奪可能になってから</div>
+                <div style={{ color: status.color, fontWeight: 700, fontSize: 13, fontFamily: "monospace" }}>
+                  {formatDuration(status.elapsed)}
+                </div>
+              </div>
+              <div style={{ background: "#ffffff08", borderRadius: 8, padding: "6px 10px" }}>
+                <div style={{ color: "#718096", fontSize: 10 }}>争奪可能開始</div>
+                <div style={{ color: "#a0aec0", fontWeight: 700, fontSize: 13 }}>
+                  {formatDateTime(status.protectEnd)}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* SVS保護OK */}
+          {covered && (
+            <div style={{ marginTop: 8, padding: "6px 10px", background: "#48bb7820", borderRadius: 8, border: "1px solid #48bb7860" }}>
+              <span style={{ color: "#68d391", fontSize: 12, fontWeight: 700 }}>✅ SVS時に保護状態！</span>
+            </div>
+          )}
+
+          {/* 次回更新予定（サイクル一覧の先頭） */}
+          {!covered && svsStart > now && (
+            cycles.length > 0 ? (
+              <div style={{ marginTop: 8, padding: "8px 10px", background: "#63b3ed15", borderRadius: 8, border: "1px solid #63b3ed40" }}>
+                <div style={{ color: "#90cdf4", fontSize: 11, fontWeight: 700 }}>🔄 次回更新予定</div>
+                <div style={{ color: "#bee3f8", fontSize: 13, fontWeight: 700, marginTop: 2 }}>
+                  {formatDateTime(cycles[0].captureTime)}
+                  {cycles.length > 1 && <span style={{ color: "#718096", fontSize: 11, fontWeight: 400 }}> （SVSまで残り{cycles.length}回・詳細は▼で確認）</span>}
+                  {cycles.length === 1 && <span style={{ color: "#68d391", fontSize: 11, fontWeight: 700 }}> ←これでSVS保護OK</span>}
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginTop: 8, padding: "6px 10px", background: "#e9456015", borderRadius: 8, border: "1px solid #e9456040" }}>
+                <span style={{ color: "#fc8181", fontSize: 12, fontWeight: 700 }}>⚠ 保護がSVS中に切れる予定。今回は対応が難しいタイミング</span>
+              </div>
+            )
+          )}
+
+          {/* 展開パネル */}
+          {expanded && (
+            <div style={{ marginTop: 12, borderTop: "1px solid #4a556840", paddingTop: 12 }}>
+              {cycles.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ color: "#a0aec0", fontSize: 12, marginBottom: 8 }}>📅 SVSまでの更新サイクル一覧</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {cycles.map((c, i) => (
+                      <div key={i} style={{
+                        display: "flex", justifyContent: "space-between", alignItems: "center",
+                        padding: "6px 10px", borderRadius: 8,
+                        background: c.covers ? "#48bb7820" : "#ffffff08",
+                        border: `1px solid ${c.covers ? "#48bb7860" : "#4a556840"}`
+                      }}>
+                        <div style={{ fontSize: 12 }}>
+                          <span style={{ color: "#718096" }}>#{i + 1} </span>
+                          <span style={{ color: "#cbd5e0", fontWeight: 700 }}>{formatDateTime(c.captureTime)}</span>
+                          <span style={{ color: "#718096" }}> 更新 → </span>
+                          <span style={{ color: "#cbd5e0" }}>{formatDateTime(c.protectEnd)} 切れ</span>
+                        </div>
+                        {c.covers && <span style={{ color: "#68d391", fontSize: 11, fontWeight: 700, flexShrink: 0, marginLeft: 6 }}>✅SVS</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div style={{ color: "#a0aec0", fontSize: 12, marginBottom: 8 }}>保護開始時刻を設定</div>
+              <button onClick={handleNow} style={{
+                width: "100%", padding: "10px", borderRadius: 10, border: "none",
+                background: "linear-gradient(90deg, #48bb78, #2f855a)", color: "#fff",
+                fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 10
+              }}>
+                ✅ 今、確保完了した！
+              </button>
+
+              <div style={{ color: "#718096", fontSize: 11, marginBottom: 6 }}>確保中の場合：ゲーム内の「確保完了まで」を入力</div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 14 }}>
+                <input
+                  type="number" inputMode="numeric" min="0" max="59" placeholder="0"
+                  value={captureM}
+                  onChange={e => setCaptureM(e.target.value)}
+                  style={{
+                    width: 60, background: "#2d3748", border: "1px solid #4a5568",
+                    borderRadius: 8, color: "#fff", padding: "8px 6px", fontSize: 14, textAlign: "center"
+                  }}
+                />
+                <span style={{ color: "#a0aec0", fontSize: 12 }}>分</span>
+                <input
+                  type="number" inputMode="numeric" min="0" max="59" placeholder="0"
+                  value={captureS}
+                  onChange={e => setCaptureS(e.target.value)}
+                  style={{
+                    width: 60, background: "#2d3748", border: "1px solid #4a5568",
+                    borderRadius: 8, color: "#fff", padding: "8px 6px", fontSize: 14, textAlign: "center"
+                  }}
+                />
+                <span style={{ color: "#a0aec0", fontSize: 12 }}>秒</span>
+                <button onClick={handleCaptureSubmit} style={{
+                  flex: 1, padding: "8px 14px", borderRadius: 8, border: "none",
+                  background: "linear-gradient(90deg, #2b6cb0, #2c5282)", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer"
+                }}>設定</button>
+              </div>
+
+              {station.protectStart && (
+                <button onClick={() => onReset(index)} style={{
+                  width: "100%", padding: "8px", borderRadius: 8, border: "1px solid #fc818140",
+                  background: "transparent", color: "#fc8181", fontSize: 12, cursor: "pointer"
+                }}>🗑 リセット</button>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function App() {
+      const [now, setNow] = useState(new Date());
+      const [svsDate, setSvsDate] = useState(() => {
+        const saved = localStorage.getItem("wos_svs_date");
+        return saved ? new Date(saved) : getNextSVS(new Date());
+      });
+      const [stations, setStations] = useState(() => {
+        const saved = localStorage.getItem("wos_stations_v2");
+        if (saved) return JSON.parse(saved);
+        return Array.from({ length: STATION_COUNT }, (_, i) => ({
+          name: `工程ステーション ${String(i + 1).padStart(2, "0")}`,
+          protectStart: null,
+        }));
+      });
+      const [showSvsEdit, setShowSvsEdit] = useState(false);
+      const [svsTmp, setSvsTmp] = useState("");
+      const [filter, setFilter] = useState("all");
+
+      useEffect(() => {
+        const t = setInterval(() => setNow(new Date()), 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => {
+        localStorage.setItem("wos_stations_v2", JSON.stringify(stations));
+      }, [stations]);
+
+      useEffect(() => {
+        localStorage.setItem("wos_svs_date", svsDate.toISOString());
+      }, [svsDate]);
+
+      const handleSetProtect = useCallback((index, date) => {
+        setStations(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index], protectStart: date.toISOString() };
+          return next;
+        });
+      }, []);
+
+      const handleReset = useCallback((index) => {
+        setStations(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index], protectStart: null };
+          return next;
+        });
+      }, []);
+
+      const handleRename = useCallback((index, name) => {
+        setStations(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index], name };
+          return next;
+        });
+      }, []);
+
+      const handleSvsChange = () => {
+        if (svsTmp) { setSvsDate(new Date(svsTmp)); setShowSvsEdit(false); }
+      };
+
+      const svsEnd = new Date(svsDate.getTime() + SVS_DURATION);
+
+      const statuses = stations.map(s => getStationStatus(s, now));
+      const coveredCount = stations.filter(s => willBeProtectedAtSVS(s, svsDate, svsEnd)).length;
+      const contestCount = statuses.filter(s => s.type === "contest").length;
+      const idleCount = statuses.filter(s => s.type === "idle").length;
+
+      const filteredIndices = stations.map((_, i) => i).filter(i => {
+        if (filter === "all") return true;
+        const st = statuses[i];
+        if (filter === "ready") return willBeProtectedAtSVS(stations[i], svsDate, svsEnd);
+        if (filter === "contest") return st.type === "contest";
+        if (filter === "idle") return st.type === "idle";
+        return true;
+      });
+
+      return (
+        <div style={{
+          minHeight: "100vh",
+          background: "linear-gradient(180deg, #0d0d1a 0%, #0a0a14 100%)",
+          color: "#e2e8f0", padding: "0 0 60px 0"
+        }}>
+          {/* ヘッダー */}
+          <div style={{
+            background: "linear-gradient(135deg, #0d0d1a, #1a1a3e)",
+            borderBottom: "1px solid #e9456030",
+            padding: "14px 16px", position: "sticky", top: 0, zIndex: 100,
+            backdropFilter: "blur(10px)"
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", maxWidth: 480, margin: "0 auto" }}>
+              <div>
+                <div style={{ color: "#e94560", fontSize: 10, fontWeight: 700, letterSpacing: 3 }}>WHITEOUT SURVIVAL</div>
+                <div style={{ color: "#fff", fontSize: 17, fontWeight: 900, letterSpacing: 1 }}>🏭 工程ステーション管理</div>
+              </div>
+              <div style={{
+                textAlign: "right", background: "#ffffff10", borderRadius: 8, padding: "6px 12px",
+                border: "1px solid #ffffff20"
+              }}>
+                <div style={{ color: "#48bb78", fontSize: 20, fontWeight: 900 }}>{coveredCount}</div>
+                <div style={{ color: "#718096", fontSize: 10 }}>/ 12 保護OK</div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ padding: "16px", maxWidth: 480, margin: "0 auto" }}>
+            <SVSCountdown svsStart={svsDate} svsEnd={svsEnd} now={now} coveredCount={coveredCount} />
+
+            {/* SVS日時変更ボタン */}
+            <button
+              onClick={() => { setShowSvsEdit(!showSvsEdit); setSvsTmp(toLocalInputValue(svsDate)); }}
+              style={{
+                width: "100%", padding: "10px", borderRadius: 10,
+                background: "transparent", border: "1px solid #4a5568",
+                color: "#a0aec0", fontSize: 12, cursor: "pointer", marginBottom: 10
+              }}
+            >
+              📅 SVS日時を変更する
+            </button>
+
+            {showSvsEdit && (
+              <div style={{ background: "#1a202c", borderRadius: 12, padding: 14, marginBottom: 12, border: "1px solid #4a5568" }}>
+                <div style={{ color: "#a0aec0", fontSize: 12, marginBottom: 8 }}>SVS開始日時（土曜 19:00）</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    type="datetime-local"
+                    value={svsTmp}
+                    onChange={e => setSvsTmp(e.target.value)}
+                    style={{
+                      flex: 1, background: "#2d3748", border: "1px solid #4a5568",
+                      borderRadius: 8, color: "#fff", padding: "10px", fontSize: 14
+                    }}
+                  />
+                  <button onClick={handleSvsChange} style={{
+                    padding: "10px 16px", borderRadius: 8, border: "none",
+                    background: "#e94560", color: "#fff", fontWeight: 700, cursor: "pointer"
+                  }}>確定</button>
+                </div>
+              </div>
+            )}
+
+            {/* サマリー */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
+              {[
+                { label: "🛡 保護OK", count: coveredCount, color: "#48bb78" },
+                { label: "⚔ 争奪可能中", count: contestCount, color: "#ed8936" },
+                { label: "⬜ 未設定", count: idleCount, color: "#718096" },
+              ].map(item => (
+                <div key={item.label} style={{
+                  background: "#1a202c", borderRadius: 12, padding: "10px",
+                  border: `1px solid ${item.color}30`, textAlign: "center"
+                }}>
+                  <div style={{ color: item.color, fontSize: 22, fontWeight: 900 }}>{item.count}</div>
+                  <div style={{ color: "#718096", fontSize: 11, marginTop: 2 }}>{item.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* フィルター */}
+            <div style={{ display: "flex", gap: 6, marginBottom: 12, overflowX: "auto", paddingBottom: 4 }}>
+              {[
+                { key: "all", label: "全て" },
+                { key: "ready", label: "🛡 保護OK" },
+                { key: "contest", label: "⚔ 争奪可能中" },
+                { key: "idle", label: "⬜ 未設定" },
+              ].map(f => (
+                <button key={f.key} onClick={() => setFilter(f.key)} style={{
+                  padding: "6px 14px", borderRadius: 20, border: "none",
+                  background: filter === f.key ? "#e94560" : "#2d3748",
+                  color: filter === f.key ? "#fff" : "#a0aec0",
+                  fontWeight: filter === f.key ? 700 : 400,
+                  fontSize: 12, cursor: "pointer", whiteSpace: "nowrap"
+                }}>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+
+            {/* ステーション一覧 */}
+            {filteredIndices.map(i => (
+              <StationCard
+                key={i}
+                station={stations[i]}
+                index={i}
+                now={now}
+                svsStart={svsDate}
+                svsEnd={svsEnd}
+                onSetProtect={handleSetProtect}
+                onReset={handleReset}
+                onRename={handleRename}
+              />
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
