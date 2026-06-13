@@ -177,6 +177,7 @@
       const [expanded, setExpanded] = useState(false);
       const [captureM, setCaptureM] = useState("");
       const [captureS, setCaptureS] = useState("");
+      const [customDate, setCustomDate] = useState("");
       const [editingName, setEditingName] = useState(false);
       const [nameInput, setNameInput] = useState(station.name);
 
@@ -193,6 +194,20 @@
 
       const handleNow = () => {
         onSetProtect(index, new Date());
+      };
+
+      const handleCustomSubmit = () => {
+        if (!customDate) return;
+        onSetProtect(index, new Date(customDate));
+        setCustomDate("");
+      };
+
+      // 展開時、現在の保護開始時刻を初期値として入力欄にセット
+      const handleExpand = () => {
+        if (!expanded && station.protectStart) {
+          setCustomDate(toLocalInputValue(new Date(station.protectStart)));
+        }
+        setExpanded(!expanded);
       };
 
       // 「確保完了まで残り○分○秒」から、保護開始時刻(=確保完了時刻)を逆算
@@ -271,7 +286,7 @@
               </div>
             </div>
             {!editingName && (
-              <button onClick={() => setExpanded(!expanded)} style={{
+              <button onClick={handleExpand} style={{
                 background: "none", border: "1px solid #4a556880", borderRadius: 8,
                 color: "#a0aec0", padding: "4px 10px", fontSize: 12, cursor: "pointer", flexShrink: 0, marginLeft: 8
               }}>
@@ -418,6 +433,23 @@
                 <button onClick={handleCaptureSubmit} style={{
                   flex: 1, padding: "8px 14px", borderRadius: 8, border: "none",
                   background: "linear-gradient(90deg, #2b6cb0, #2c5282)", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer"
+                }}>設定</button>
+              </div>
+
+              <div style={{ color: "#718096", fontSize: 11, marginBottom: 6 }}>保護開始時刻を直接指定</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+                <input
+                  type="datetime-local"
+                  value={customDate}
+                  onChange={e => setCustomDate(e.target.value)}
+                  style={{
+                    flex: 1, background: "#2d3748", border: "1px solid #4a5568",
+                    borderRadius: 8, color: "#fff", padding: "8px 10px", fontSize: 12
+                  }}
+                />
+                <button onClick={handleCustomSubmit} style={{
+                  padding: "8px 14px", borderRadius: 8, border: "none",
+                  background: "#4a5568", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer"
                 }}>設定</button>
               </div>
 
